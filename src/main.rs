@@ -1,3 +1,4 @@
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process;
@@ -13,6 +14,7 @@ use miette::IntoDiagnostic;
 mod shell;
 use shell::Shell;
 use shell::ShellKind;
+use tempfile::NamedTempFile;
 
 mod nix;
 
@@ -96,6 +98,57 @@ fn main() -> miette::Result<()> {
     })?;
     tracing::debug!(%shell, input=opts.shell, "Detected shell");
 
+    let shell_path = find_on_path(Utf8Path::new(&shell.kind.to_string()))?
+        .ok_or_else(|| {
+            miette!(
+                "Failed to find binary for shell `{}` on $PATH",
+                shell.kind.to_string()
+            )
+        })?
+        .to_string();
+
+    let temp_init_file = match shell.kind {
+        // these shells don't have a flag that executes a command
+        // and enters interactive mode - instead we write that to a
+        // tempfile and pass that as the init file
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Xonsh => {
+            let mut tmp = NamedTempFile::new()
+                .map_err(|err| miette!("Failed to create a tempfile with IO error: {err}"))?;
+
+            if shell.kind == ShellKind::Xonsh {
+                write!(tmp, "@.env.set(\"SHELL\", \"{shell_path}\")").map_err(|err| {
+                    miette!("Failed to write init commands to tempfile with IO error: {err}")
+                })?;
+            } else {
+                write!(tmp, "export SHELL=\"{shell_path}\"").map_err(|err| {
+                    miette!("Failed to write init commands to tempfile with IO error: {err}")
+                })?;
+            }
+
+            Some(tmp)
+        }
+        // these do and are set below in command_args
+        ShellKind::Fish | ShellKind::Nushell => None,
+    };
+
+    let temp_path = temp_init_file
+        .as_ref()
+        .map(|tmp| tmp.path().to_string_lossy().to_string())
+        // if temp_init_file is None, this won't be used either way
+        .unwrap_or(String::new());
+
+    let mut command_args: Vec<String> = match shell.kind {
+        ShellKind::Zsh => vec![
+            "-c".to_string(),
+            format!("source {temp_path}; exec {shell_path}"),
+        ],
+        ShellKind::Fish => vec!["-C".to_string(), format!("set SHELL {shell_path}")],
+        ShellKind::Bash => vec!["--init-file".to_string(), temp_path],
+        ShellKind::Nushell => vec!["-e".to_string(), format!("$env.SHELL = \"{shell_path}\"")],
+        ShellKind::Xonsh => vec!["--rc".to_string(), temp_path],
+    };
+    command_args.extend(opts.shell_args);
+
     match opts.command.unwrap_or_default() {
         Command::Env => {
             let template = match shell.kind {
@@ -124,13 +177,13 @@ fn main() -> miette::Result<()> {
         }
 
         Command::NixShell { args } => {
-            let new_args = nix::transform_nix_shell(args, shell.path.as_str(), &opts.shell_args);
+            let new_args = nix::transform_nix_shell(args, shell.path.as_str(), &command_args);
             let prog = if opts.nom { "nom-shell" } else { "nix-shell" };
             exec_command(prog, new_args, "nix-shell")
         }
 
         Command::Nix { args } => {
-            let new_args = nix::transform_nix(args, shell.path.as_str(), opts.shell_args);
+            let new_args = nix::transform_nix(args, shell.path.as_str(), command_args);
             let prog = if opts.nom
                 && new_args
                     .subcommand
@@ -141,7 +194,15 @@ fn main() -> miette::Result<()> {
             } else {
                 "nix"
             };
-            exec_command(prog, new_args.args, "nix")
+
+            exec_command(prog, new_args.args, "nix")?;
+
+            if let Some(tmp) = temp_init_file {
+                tmp.close()
+                    .map_err(|err| miette!("Failed to close tempfile with IO error: {err}"))?;
+            }
+
+            Ok(())
         }
     }
 }
@@ -186,6 +247,18 @@ fn executable_is_on_path(executable: &Utf8Path) -> miette::Result<bool> {
         .split(':')
         .map(Utf8Path::new)
         .any(|component| component == directory))
+}
+
+fn find_on_path(executable: &Utf8Path) -> miette::Result<Option<Utf8PathBuf>> {
+    let path = std::env::var("PATH")
+        .into_diagnostic()
+        .wrap_err("Failed to get $PATH environment variable")?;
+
+    Ok(path
+        .split(":")
+        .map(Utf8PathBuf::from)
+        .map(|dir| dir.join(executable))
+        .find(|exec| exec.is_file()))
 }
 
 fn exec_command(prog: &str, args: Vec<String>, label: &str) -> miette::Result<()> {

@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use miette::miette;
 
 /// A user's shell.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ShellKind {
     /// The `zsh` shell.
     /// <https://zsh.sourceforge.io/>
